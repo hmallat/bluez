@@ -24,6 +24,7 @@ Patch4:     install-more-binary-test.patch
 Patch5:     install-test-scripts.patch
 Patch6:     0001-Adding-snowball-target-and-line-disc.patch
 Patch7:     allow-ofono-communication.patch
+Patch8:     telephony-feature-configuration.patch
 Requires:   bluez-libs = %{version}
 Requires:   dbus >= 0.60
 Requires:   hwdata >= 0.215
@@ -158,6 +159,8 @@ This package provides default configs for bluez
 %patch6 -p1
 # allow-ofono-communication.patch
 %patch7 -p1
+# telephony-feature-configuration.patch
+%patch8 -p1
 # >> setup
 # << setup
 
