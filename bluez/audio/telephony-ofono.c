@@ -56,6 +56,7 @@ enum net_registration_status {
 
 struct voice_call {
 	char *obj_path;
+	char *vcmanager_path;
 	int status;
 	gboolean originating;
 	gboolean conference;
@@ -71,6 +72,7 @@ struct voice_call {
 struct dial {
 	gchar *hold_dial_clir;
 	gchar *hold_dial_number;
+	char *vcmanager_path;
 };
 
 static DBusConnection *connection = NULL;
@@ -128,6 +130,50 @@ static struct indicator ofono_indicators[] =
 
 static void update_call_status(void);
 
+static struct voice_call *nth_call_at(const char *vcmanager_path,
+					int n)
+{
+	int count = 0;
+	GSList *l;
+
+	DBG("%s[%d]", vcmanager_path, n);
+
+	for (l = calls; l != NULL; l = l->next) {
+		struct voice_call *vc = l->data;
+		if (!g_strcmp0(vcmanager_path, vc->vcmanager_path)) {
+			if (n == count)
+				return vc;
+			count++;
+		}
+	}
+
+	return NULL;
+}
+
+/* Voicecall manager which is the target of call management (placing
+   calls on hold, swapping active and held calls, multiparty call
+   management) */
+static const char *active_vcmanager_path(void)
+{
+	DBG("%s", modem_obj_path);
+	return modem_obj_path;
+}
+
+/* Voicecall manager which is preferred for establishing new calls
+   (can be the same as active vcamanager) */
+static const char *preferred_vcmanager_path(void)
+{
+	DBG("%s", modem_obj_path);
+	return modem_obj_path;
+}
+
+static gboolean known_vcmanager_path(const char *vcmanager_path)
+{
+	return (!modem_obj_path || g_strcmp0(vcmanager_path, modem_obj_path))
+		? FALSE
+		: TRUE;
+}
+
 static void waiting_for_answer_clear(struct voice_call *vc)
 {
 	DBG("");
@@ -151,13 +197,14 @@ static void status_clear(struct voice_call *vc)
 	vc->status_pending = FALSE;
 }
 
-static void status_set_all(void)
+static void status_set_all(const char *vcmanager_path)
 {
 	GSList *l;
 
 	for (l = calls; l != NULL; l = l->next) {
 		struct voice_call *vc = l->data;
-		vc->status_pending = TRUE;
+		if (!g_strcmp0(vcmanager_path, vc->vcmanager_path))
+			vc->status_pending = TRUE;
 	}
 }
 
@@ -196,6 +243,22 @@ static struct voice_call *find_vc_with_status(int status)
 		struct voice_call *vc = l->data;
 
 		if (vc->status == status)
+			return vc;
+	}
+
+	return NULL;
+}
+
+static struct voice_call *find_vc_with_status_at(const char *vcmanager_path,
+							int status)
+{
+	GSList *l;
+
+	for (l = calls; l != NULL; l = l->next) {
+		struct voice_call *vc = l->data;
+
+		if (!g_strcmp0(vcmanager_path, vc->vcmanager_path) &&
+				vc->status == status)
 			return vc;
 	}
 
@@ -374,15 +437,15 @@ static void answer_waiting_call(void)
 	}
 }
 
-static int release_answer_calls(void)
+static int release_answer_calls(const char *vcmanager_path)
 {
 	struct voice_call *active = NULL;
 	struct voice_call *waiting = NULL;
 
-	DBG("");
+	DBG("%s", vcmanager_path);
 
-	active = find_vc_with_status(CALL_STATUS_ACTIVE);
-	waiting = find_vc_with_status(CALL_STATUS_WAITING);
+	active = find_vc_with_status_at(vcmanager_path, CALL_STATUS_ACTIVE);
+	waiting = find_vc_with_status_at(vcmanager_path, CALL_STATUS_WAITING);
 	if (active == NULL || waiting == NULL)
 		return -EIO;
 
@@ -395,19 +458,19 @@ static int release_answer_calls(void)
 						DBUS_TYPE_INVALID);
 }
 
-static int release_swap_calls(void)
+static int release_swap_calls(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"ReleaseAndSwap",
 						NULL, NULL, DBUS_TYPE_INVALID);
 }
 
-static int hold_answer_calls(void)
+static int hold_answer_calls(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"HoldAndAnswer",
 						NULL, NULL, DBUS_TYPE_INVALID);
@@ -415,10 +478,10 @@ static int hold_answer_calls(void)
 
 static int split_call(struct voice_call *call)
 {
-	DBG("%s", modem_obj_path);
+	DBG("%s", call->vcmanager_path);
 	DBG("%s", call->number);
 	DBG("%s", call->obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	return send_method_call(OFONO_BUS_NAME, call->vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"PrivateChat",
 						NULL, NULL,
@@ -428,37 +491,37 @@ static int split_call(struct voice_call *call)
 	return -1;
 }
 
-static int swap_calls(void)
+static int swap_calls(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"SwapCalls",
 						NULL, NULL, DBUS_TYPE_INVALID);
 }
 
-static int create_conference(void)
+static int create_conference(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"CreateMultiparty",
 						NULL, NULL, DBUS_TYPE_INVALID);
 }
 
-static int release_conference(void)
+static int release_conference(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"HangupMultiparty",
 						NULL, NULL, DBUS_TYPE_INVALID);
 }
 
-static int call_transfer(void)
+static int call_transfer(const char *vcmanager_path)
 {
-	DBG("%s", modem_obj_path);
-	return send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	DBG("%s", vcmanager_path);
+	return send_method_call(OFONO_BUS_NAME, vcmanager_path,
 						OFONO_VCMANAGER_INTERFACE,
 						"Transfer",
 						NULL, NULL, DBUS_TYPE_INVALID);
@@ -485,7 +548,7 @@ void telephony_terminate_call_req(void *telephony_device)
 	if (call->status == CALL_STATUS_HELD && alerting)
 		err = release_call(alerting);
 	else if (call->conference)
-		err = release_conference();
+		err = release_conference(call->vcmanager_path);
 	else
 		err = release_call(call);
 
@@ -532,7 +595,7 @@ void telephony_dial_number_req(void *telephony_device, const char *number)
 
 	DBG("telephony-ofono: dial request to %s", number);
 
-	if (!modem_obj_path) {
+	if (!preferred_vcmanager_path()) {
 		telephony_dial_number_rsp(telephony_device,
 					CME_ERROR_AG_FAILURE);
 		return;
@@ -576,7 +639,7 @@ void telephony_dial_number_req(void *telephony_device, const char *number)
 		vc->hold_dial_number = g_strdup(number);
 		g_free(vc->hold_dial_clir);
 		vc->hold_dial_clir = g_strdup(clir);
-		if (swap_calls() != 0)
+		if (swap_calls(vc->vcmanager_path) != 0)
 			telephony_dial_number_rsp(telephony_device,
 						CME_ERROR_AG_FAILURE);
 		else
@@ -585,7 +648,7 @@ void telephony_dial_number_req(void *telephony_device, const char *number)
 		return;
 	}
 
-	ret = send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	ret = send_method_call(OFONO_BUS_NAME, preferred_vcmanager_path(),
 			OFONO_VCMANAGER_INTERFACE,
                         "Dial", NULL, NULL,
 			DBUS_TYPE_STRING, &number,
@@ -606,14 +669,14 @@ void telephony_transmit_dtmf_req(void *telephony_device, char tone)
 
 	DBG("telephony-ofono: transmit dtmf: %c", tone);
 
-	if (!modem_obj_path) {
+	if (!preferred_vcmanager_path()) {
 		telephony_transmit_dtmf_rsp(telephony_device,
 					CME_ERROR_AG_FAILURE);
 		return;
 	}
 
 	tone_string = g_strdup_printf("%c", tone);
-	ret = send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	ret = send_method_call(OFONO_BUS_NAME, preferred_vcmanager_path(),
 			OFONO_VCMANAGER_INTERFACE,
 			"SendTones", NULL, NULL,
 			DBUS_TYPE_STRING, &tone_string,
@@ -688,15 +751,159 @@ static void foreach_vc_with_status(int status,
 	}
 }
 
+static void foreach_vc_with_status_at(const char *vcmanager_path,
+					int status,
+					int (*func)(struct voice_call *vc))
+{
+	GSList *l;
+
+	for (l = calls; l != NULL; l = l->next) {
+		struct voice_call *call = l->data;
+
+		if (!g_strcmp0(vcmanager_path, call->vcmanager_path) &&
+				call->status == status)
+			func(call);
+	}
+}
+
+static cme_error_t chld0(const char *vcmanager_path)
+{
+	/* HFP 1.5 documentation on AT+CHLD:
+
+	   "0 = Releases all held calls or sets User Determined User
+	   Busy (UDUB) for a waiting call."
+
+	*/
+
+	if (find_vc_with_status_at(vcmanager_path, CALL_STATUS_WAITING))
+		foreach_vc_with_status_at(vcmanager_path,
+						CALL_STATUS_WAITING,
+						release_call);
+	else
+		foreach_vc_with_status_at(vcmanager_path,
+						CALL_STATUS_HELD,
+						release_call);
+
+	return 0;
+}
+
+static cme_error_t chld1(const char *vcmanager_path, struct voice_call *call)
+{
+	/* HFP 1.5 documentation on AT+CHLD:
+
+	   "1 = Releases all active calls (if any exist) and accepts
+	   the other (held or waiting) call.
+
+	   1<idx> = Releases specified active call only (<idx>)."
+
+	*/
+
+	if (call) {
+		if (release_call(call) != 0)
+			return CME_ERROR_AG_FAILURE;
+	} else {
+		call = find_vc_with_status_at(vcmanager_path,
+						CALL_STATUS_WAITING);
+		if (call) {
+			if (release_answer_calls(vcmanager_path) != 0)
+				return CME_ERROR_AG_FAILURE;
+		} else {
+			if (release_swap_calls(vcmanager_path) != 0)
+				return CME_ERROR_AG_FAILURE;
+		}
+	}
+
+	return 0;
+}
+
+static cme_error_t chld2(const char *vcmanager_path, struct voice_call *call)
+{
+	/* HFP 1.5 documentation on AT+CHLD:
+
+	   "2 = Places all active calls (if any exist) on hold and accepts
+	   the other (held or waiting) call.
+
+	   2<idx> = Request private consultation mode with specified
+	   call (<idx>).  (Place all calls on hold EXCEPT the call
+	   indicated by <idx>.)"
+
+	*/
+
+	if (call) {
+		if (split_call(call) != 0)
+			return CME_ERROR_AG_FAILURE;
+	} else {
+		call = find_vc_with_status_at(vcmanager_path,
+						CALL_STATUS_WAITING);
+
+		if (call) {
+			if (hold_answer_calls(vcmanager_path) != 0)
+				return CME_ERROR_AG_FAILURE;
+		} else {
+			if (swap_calls(vcmanager_path) != 0)
+				return CME_ERROR_AG_FAILURE;
+		}
+	}
+
+	return 0;
+}
+
+static cme_error_t chld3(const char *vcmanager_path)
+{
+	/* HFP 1.5 documentation on AT+CHLD:
+
+	   "3 = Adds a held call to the conversation."
+
+	*/
+
+	if (!(telephony_supp_features & AG_FEATURE_SUPP_CONF_CALL))
+		return CME_ERROR_NOT_SUPPORTED;
+
+	if (find_vc_with_status_at(vcmanager_path, CALL_STATUS_HELD) ||
+		find_vc_with_status_at(vcmanager_path, CALL_STATUS_WAITING)) {
+		if (create_conference(vcmanager_path) != 0)
+			return CME_ERROR_AG_FAILURE;
+	} else {
+		return CME_ERROR_NOT_ALLOWED;
+	}
+
+	return 0;
+}
+
+static cme_error_t chld4(const char *vcmanager_path)
+{
+	/* HFP 1.5 documentation on AT+CHLD:
+
+	   "Connects the two calls and disconnects the subscriber from
+	   both calls (Explicit Call Transfer)."
+
+	*/
+
+	if (!(telephony_supp_features & AG_FEATURE_SUPP_CONF_CALL))
+		return CME_ERROR_NOT_SUPPORTED;
+
+	if (find_vc_with_status_at(vcmanager_path, CALL_STATUS_HELD) ||
+		find_vc_with_status_at(vcmanager_path, CALL_STATUS_WAITING)) {
+		if (call_transfer(vcmanager_path) != 0)
+			return CME_ERROR_AG_FAILURE;
+	} else {
+		return CME_ERROR_NOT_ALLOWED;
+	}
+
+	return 0;
+}
+
 void telephony_call_hold_req(void *telephony_device, const char *cmd)
 {
 	const char *idx = NULL;
 	struct voice_call *call = NULL;
 	cme_error_t cme_err = CME_ERROR_NONE;
+	const char *vcmanager_path = NULL;
 
 	DBG("telephony-ofono: got call hold request %s", cmd);
 
-	if (!modem_obj_path) {
+	vcmanager_path = active_vcmanager_path();
+	if (!vcmanager_path) {
 		cme_err = CME_ERROR_AG_FAILURE;
 		goto done;
 	}
@@ -722,7 +929,7 @@ void telephony_call_hold_req(void *telephony_device, const char *cmd)
 		idx = NULL;
 
 	if (idx) {
-		call = g_slist_nth_data(calls, strtol(idx, NULL, 0) - 1);
+		call = nth_call_at(vcmanager_path, strtol(idx, NULL, 0) - 1);
 		if (call == NULL) {
 			cme_err = CME_ERROR_INVALID_INDEX;
 			goto done;
@@ -732,69 +939,19 @@ void telephony_call_hold_req(void *telephony_device, const char *cmd)
 
 	switch (cmd[0]) {
 	case '0':
-		if (find_vc_with_status(CALL_STATUS_WAITING))
-			foreach_vc_with_status(CALL_STATUS_WAITING,
-								release_call);
-		else
-			foreach_vc_with_status(CALL_STATUS_HELD, release_call);
+		cme_err = chld0(vcmanager_path);
 		break;
 	case '1':
-		if (idx) {
-			if (release_call(call) != 0)
-				cme_err = CME_ERROR_AG_FAILURE;
-		} else {
-			call = find_vc_with_status(CALL_STATUS_WAITING);
-
-			if (call) {
-				if (release_answer_calls() != 0)
-					cme_err = CME_ERROR_AG_FAILURE;
-			} else {
-				if (release_swap_calls() != 0)
-					cme_err = CME_ERROR_AG_FAILURE;
-			}
-		}
+		cme_err = chld1(vcmanager_path, call);
 		break;
 	case '2':
-		if (idx) {
-			if (split_call(call))
-				cme_err = CME_ERROR_AG_FAILURE;
-		} else {
-			call = find_vc_with_status(CALL_STATUS_WAITING);
-
-			if (call) {
-				if (hold_answer_calls())
-					cme_err = CME_ERROR_AG_FAILURE;
-			} else {
-				if (swap_calls())
-					cme_err = CME_ERROR_AG_FAILURE;
-			}
-		}
+		cme_err = chld2(vcmanager_path, call);
 		break;
 	case '3':
-		if (!(telephony_supp_features & AG_FEATURE_SUPP_CONF_CALL)) {
-			cme_err = CME_ERROR_NOT_SUPPORTED;
-		} else {
-			if (find_vc_with_status(CALL_STATUS_HELD) ||
-				find_vc_with_status(CALL_STATUS_WAITING)) {
-				if (create_conference())
-					cme_err = CME_ERROR_AG_FAILURE;
-			} else {
-				cme_err = CME_ERROR_NOT_ALLOWED;
-			}
-		}
+		cme_err = chld3(vcmanager_path);
 		break;
 	case '4':
-		if (!(telephony_supp_features & AG_FEATURE_SUPP_CONF_CALL)) {
-			cme_err = CME_ERROR_NOT_SUPPORTED;
-		} else {
-			if (find_vc_with_status(CALL_STATUS_HELD) ||
-				find_vc_with_status(CALL_STATUS_WAITING)) {
-				if (call_transfer())
-					cme_err = CME_ERROR_AG_FAILURE;
-			} else {
-				cme_err = CME_ERROR_NOT_ALLOWED;
-			}
-		}
+		cme_err = chld4(vcmanager_path);
 		break;
 	default:
 		DBG("Unknown call hold request");
@@ -804,7 +961,7 @@ void telephony_call_hold_req(void *telephony_device, const char *cmd)
 
 done:
 	if (cme_err == CME_ERROR_NONE) /* wait for all call statuses now */
-		status_set_all();
+		status_set_all(vcmanager_path);
 
 	telephony_call_hold_rsp(telephony_device, cme_err);
 }
@@ -893,6 +1050,7 @@ static void call_free(void *data)
 		telephony_calling_stopped_ind();
 
 	g_dbus_remove_watch(connection, vc->watch);
+	g_free(vc->vcmanager_path);
 	g_free(vc->obj_path);
 	g_free(vc->number);
 	g_free(vc->hold_dial_clir);
@@ -950,7 +1108,7 @@ static void update_call_status(void)
 static gboolean dial_after_hold(gpointer data)
 {
 	struct dial *d = (struct dial *)data;
-	send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	send_method_call(OFONO_BUS_NAME, d->vcmanager_path,
 			OFONO_VCMANAGER_INTERFACE,
 			"Dial", NULL, NULL,
 			DBUS_TYPE_STRING, &d->hold_dial_number,
@@ -958,6 +1116,7 @@ static gboolean dial_after_hold(gpointer data)
 			DBUS_TYPE_INVALID);
 	g_free(d->hold_dial_clir);
 	g_free(d->hold_dial_number);
+	g_free(d->vcmanager_path);
 	g_free(d);
 
 	return FALSE;
@@ -1030,6 +1189,8 @@ static gboolean handle_vc_property_changed(DBusConnection *conn,
 				d->hold_dial_number = vc->hold_dial_number;
 				vc->hold_dial_clir = NULL;
 				vc->hold_dial_number = NULL;
+				d->vcmanager_path =
+					g_strdup(vc->vcmanager_path);
 				g_timeout_add_seconds(1, dial_after_hold, d);
 			}
 		}
@@ -1045,14 +1206,16 @@ static gboolean handle_vc_property_changed(DBusConnection *conn,
 	return TRUE;
 }
 
-static struct voice_call *call_new(const char *path, DBusMessageIter *properties)
+static struct voice_call *call_new(const char *path, const char *vcmanager_path, DBusMessageIter *properties)
 {
 	struct voice_call *vc;
 
 	DBG("%s", path);
+	DBG("%s", vcmanager_path);
 
 	vc = g_new0(struct voice_call, 1);
 	vc->obj_path = g_strdup(path);
+	vc->vcmanager_path = g_strdup(vcmanager_path);
 	vc->watch = g_dbus_add_signal_watch(connection, NULL, path,
 					OFONO_VC_INTERFACE, "PropertyChanged",
 					handle_vc_property_changed, vc, NULL);
@@ -1138,7 +1301,8 @@ static void remove_pending(DBusPendingCall *call)
 	dbus_pending_call_unref(call);
 }
 
-static void call_added(const char *path, DBusMessageIter *properties)
+static void call_added(const char *path, const char *vcmanager_path,
+					DBusMessageIter *properties)
 {
 	struct voice_call *vc;
 
@@ -1148,7 +1312,7 @@ static void call_added(const char *path, DBusMessageIter *properties)
 	if (vc)
 		return;
 
-	vc = call_new(path, properties);
+	vc = call_new(path, vcmanager_path, properties);
 	calls = g_slist_prepend(calls, vc);
 }
 
@@ -1157,9 +1321,11 @@ static void get_calls_reply(DBusPendingCall *call, void *user_data)
 	DBusError err;
 	DBusMessage *reply;
 	DBusMessageIter iter, entry;
+	const char *vcmanager_path = NULL;
 
 	DBG("");
 	reply = dbus_pending_call_steal_reply(call);
+	vcmanager_path = dbus_message_get_path(reply);
 
 	dbus_error_init(&err);
 	if (dbus_set_error_from_message(&err, reply)) {
@@ -1189,7 +1355,7 @@ static void get_calls_reply(DBusPendingCall *call, void *user_data)
 		dbus_message_iter_next(&value);
 		dbus_message_iter_recurse(&value, &properties);
 
-		call_added(path, &properties);
+		call_added(path, vcmanager_path, &properties);
 
 		dbus_message_iter_next(&entry);
 	}
@@ -1277,6 +1443,7 @@ static void get_properties_reply(DBusPendingCall *call, void *user_data)
 	DBusMessage *reply;
 	DBusMessageIter iter, properties;
 	int ret = 0;
+	const char *vcmanager_path = (const char *)user_data;
 
 	DBG("");
 	reply = dbus_pending_call_steal_reply(call);
@@ -1305,7 +1472,7 @@ static void get_properties_reply(DBusPendingCall *call, void *user_data)
 		goto done;
 	}
 
-	ret = send_method_call(OFONO_BUS_NAME, modem_obj_path,
+	ret = send_method_call(OFONO_BUS_NAME, vcmanager_path,
 				OFONO_VCMANAGER_INTERFACE, "GetCalls",
 				get_calls_reply, NULL, DBUS_TYPE_INVALID);
 	if (ret < 0)
@@ -1328,7 +1495,7 @@ static void network_found(const char *path)
 
 	ret = send_method_call(OFONO_BUS_NAME, path,
 				OFONO_NETWORKREG_INTERFACE, "GetProperties",
-				get_properties_reply, NULL, DBUS_TYPE_INVALID);
+			get_properties_reply, (void *)path, DBUS_TYPE_INVALID);
 	if (ret < 0)
 		error("Unable to send %s.GetProperties",
 						OFONO_NETWORKREG_INTERFACE);
@@ -1551,12 +1718,13 @@ static gboolean handle_vcmanager_call_added(DBusConnection *conn,
 						DBusMessage *msg, void *data)
 {
 	DBusMessageIter iter, properties;
-	const char *path = dbus_message_get_path(msg);
+	const char *path = NULL;
+	const char *vcmanager_path = dbus_message_get_path(msg);
 
 	audio_wakelock_get();
 
-	/* Ignore call if modem path doesn't math */
-	if (g_strcmp0(modem_obj_path, path) != 0)
+	/* Ignore call if modem path doesn't match */
+	if (!known_vcmanager_path(vcmanager_path))
 		return TRUE;
 
 	dbus_message_iter_init(msg, &iter);
@@ -1573,7 +1741,7 @@ static gboolean handle_vcmanager_call_added(DBusConnection *conn,
 	dbus_message_iter_next(&iter);
 	dbus_message_iter_recurse(&iter, &properties);
 
-	call_added(path, &properties);
+	call_added(path, vcmanager_path, &properties);
 
 	return TRUE;
 }
@@ -1595,13 +1763,9 @@ static void call_removed(const char *path)
 static gboolean handle_vcmanager_call_removed(DBusConnection *conn,
 						DBusMessage *msg, void *data)
 {
-	const char *path = dbus_message_get_path(msg);
+	const char *path = NULL;
 
 	audio_wakelock_get();
-
-	/* Ignore call if modem path doesn't math */
-	if (g_strcmp0(modem_obj_path, path) != 0)
-		return TRUE;
 
 	if (!dbus_message_get_args(msg, NULL,
 				DBUS_TYPE_OBJECT_PATH, &path,
