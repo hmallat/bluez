@@ -76,7 +76,7 @@ struct dial {
 };
 
 static DBusConnection *connection = NULL;
-static char *modem_obj_path = NULL;
+static GSList *nets = NULL;
 static char *last_dialed_number = NULL;
 static gchar *last_dialed_number_path = NULL;
 static GSList *calls = NULL;
@@ -96,14 +96,11 @@ static int battchg_cur = -1;    /* "battery.charge_level.current" */
 static int battchg_last = -1;   /* "battery.charge_level.last_full" */
 static int battchg_design = -1; /* "battery.charge_level.design" */
 
-static struct {
+struct net {
 	uint8_t status;
 	uint32_t signals_bar;
 	char *operator_name;
-} net = {
-	.status = NETWORK_REG_STATUS_NOSERV,
-	.signals_bar = 0,
-	.operator_name = NULL,
+	const char *modem_path;
 };
 
 static char *subscriber_number = NULL;
@@ -130,6 +127,21 @@ static struct indicator ofono_indicators[] =
 
 static void update_call_status(void);
 
+static void net_free(gpointer p)
+{
+	struct net *n = (struct net *)p;
+	g_free((gpointer)n->modem_path);
+	g_free(n->operator_name);
+	g_free(n);
+}
+
+static gint net_compare_modem_path(gconstpointer a, gconstpointer b)
+{
+	struct net *na = (struct net *)a;
+	struct net *nb = (struct net *)b;
+	return g_strcmp0(na->modem_path, nb->modem_path);
+}
+
 static struct voice_call *nth_call_at(const char *vcmanager_path,
 					int n)
 {
@@ -155,23 +167,44 @@ static struct voice_call *nth_call_at(const char *vcmanager_path,
    management) */
 static const char *active_vcmanager_path(void)
 {
-	DBG("%s", modem_obj_path);
-	return modem_obj_path;
+	/* TODO: this should follow audio policy when there is an
+	   active call (return manager for the call which the user is
+	   listening to), for now just use the first one */
+	struct net *net = nets ? nets->data : NULL;
+	DBG("%s", net ? net->modem_path : "");
+	return net ? net->modem_path : NULL;
 }
 
 /* Voicecall manager which is preferred for establishing new calls
    (can be the same as active vcamanager) */
 static const char *preferred_vcmanager_path(void)
 {
-	DBG("%s", modem_obj_path);
-	return modem_obj_path;
+	/* TODO: this should follow user preference setting, for now
+	   just use the first one */
+	struct net *net = nets ? nets->data : NULL;
+	DBG("%s", net ? net->modem_path : "");
+	return net ? net->modem_path : NULL;
 }
 
 static gboolean known_vcmanager_path(const char *vcmanager_path)
 {
-	return (!modem_obj_path || g_strcmp0(vcmanager_path, modem_obj_path))
-		? FALSE
-		: TRUE;
+	GSList *l;
+
+	for (l = nets; l; l = l->next) {
+		struct net *net = (struct net *)l->data;
+		if (!g_strcmp0(vcmanager_path, net->modem_path))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+static struct net *net_by_name(const char *path)
+{
+	struct net net_key;
+	net_key.modem_path = path;
+	return (struct net *) g_slist_find_custom(nets, &net_key,
+						net_compare_modem_path);
 }
 
 static void waiting_for_answer_clear(struct voice_call *vc)
@@ -731,24 +764,15 @@ void telephony_list_current_calls_req(void *telephony_device)
 
 void telephony_operator_selection_req(void *telephony_device)
 {
+	struct net *net = net_by_name(preferred_vcmanager_path());
+
 	DBG("telephony-ofono: operator selection request");
 
 	telephony_operator_selection_ind(OPERATOR_MODE_AUTO,
-				net.operator_name ? net.operator_name : "");
+					(net && net->operator_name)
+					? net->operator_name
+					: "");
 	telephony_operator_selection_rsp(telephony_device, CME_ERROR_NONE);
-}
-
-static void foreach_vc_with_status(int status,
-					int (*func)(struct voice_call *vc))
-{
-	GSList *l;
-
-	for (l = calls; l != NULL; l = l->next) {
-		struct voice_call *call = l->data;
-
-		if (call->status == status)
-			func(call);
-	}
 }
 
 static void foreach_vc_with_status_at(const char *vcmanager_path,
@@ -1365,48 +1389,68 @@ done:
 	remove_pending(call);
 }
 
-static void handle_network_property(const char *property, DBusMessageIter *variant)
+static void handle_network_property(struct net *net,
+					const char *property,
+					DBusMessageIter *variant)
 {
+	struct net *pref;
 	const char *status, *operator;
 	DBusBasicValue signals_bar;
+
+	pref = net_by_name(preferred_vcmanager_path());
 
 	if (g_str_equal(property, "Status")) {
 		dbus_message_iter_get_basic(variant, &status);
 		DBG("Status is %s", status);
 		if (g_str_equal(status, "registered")) {
-			net.status = NETWORK_REG_STATUS_HOME;
-			telephony_update_indicator(ofono_indicators,
-						"roam", EV_ROAM_INACTIVE);
-			telephony_update_indicator(ofono_indicators,
-						"service", EV_SERVICE_PRESENT);
+			net->status = NETWORK_REG_STATUS_HOME;
+			if (!pref || pref == net) {
+				telephony_update_indicator(ofono_indicators,
+							"roam",
+							EV_ROAM_INACTIVE);
+				telephony_update_indicator(ofono_indicators,
+							"service",
+							EV_SERVICE_PRESENT);
+			}
 		} else if (g_str_equal(status, "roaming")) {
-			net.status = NETWORK_REG_STATUS_ROAM;
-			telephony_update_indicator(ofono_indicators,
-						"roam", EV_ROAM_ACTIVE);
-			telephony_update_indicator(ofono_indicators,
-						"service", EV_SERVICE_PRESENT);
+			net->status = NETWORK_REG_STATUS_ROAM;
+			if (!pref || pref == net) {
+				telephony_update_indicator(ofono_indicators,
+							"roam",
+							EV_ROAM_ACTIVE);
+				telephony_update_indicator(ofono_indicators,
+							"service",
+							EV_SERVICE_PRESENT);
+			}
 		} else {
-			net.status = NETWORK_REG_STATUS_NOSERV;
-			telephony_update_indicator(ofono_indicators,
-						"roam", EV_ROAM_INACTIVE);
-			telephony_update_indicator(ofono_indicators,
-						"service", EV_SERVICE_NONE);
+			net->status = NETWORK_REG_STATUS_NOSERV;
+			if (!pref || pref == net) {
+				telephony_update_indicator(ofono_indicators,
+							"roam",
+							EV_ROAM_INACTIVE);
+				telephony_update_indicator(ofono_indicators,
+							"service",
+							EV_SERVICE_NONE);
+			}
 		}
 	} else if (g_str_equal(property, "Name")) {
 		dbus_message_iter_get_basic(variant, &operator);
 		DBG("Operator is %s", operator);
-		g_free(net.operator_name);
-		net.operator_name = g_strdup(operator);
+		g_free(net->operator_name);
+		net->operator_name = g_strdup(operator);
 	} else if (g_str_equal(property, "Strength")) {
 		dbus_message_iter_get_basic(variant, &signals_bar);
 		DBG("Strength is %u", (uint32_t)signals_bar.byt);
-		net.signals_bar = (uint32_t)signals_bar.byt;
-		telephony_update_indicator(ofono_indicators, "signal",
-						(net.signals_bar + 20) / 21);
+		net->signals_bar = (uint32_t)signals_bar.byt;
+		if (!pref || pref == net) {
+			telephony_update_indicator(ofono_indicators, "signal",
+						(net->signals_bar + 20) / 21);
+		}
 	}
 }
 
-static int parse_network_properties(DBusMessageIter *properties)
+static int parse_network_properties(struct net *net,
+				DBusMessageIter *properties)
 {
 	int i;
 
@@ -1429,7 +1473,7 @@ static int parse_network_properties(DBusMessageIter *properties)
 		dbus_message_iter_next(&entry);
 		dbus_message_iter_recurse(&entry, &value);
 
-		handle_network_property(key, &value);
+		handle_network_property(net, key, &value);
 
 		dbus_message_iter_next(properties);
 	}
@@ -1444,8 +1488,9 @@ static void get_properties_reply(DBusPendingCall *call, void *user_data)
 	DBusMessageIter iter, properties;
 	int ret = 0;
 	const char *vcmanager_path = (const char *)user_data;
+	struct net *n = NULL;
 
-	DBG("");
+	DBG("'%s'", vcmanager_path);
 	reply = dbus_pending_call_steal_reply(call);
 
 	dbus_error_init(&err);
@@ -1465,23 +1510,35 @@ static void get_properties_reply(DBusPendingCall *call, void *user_data)
 
 	dbus_message_iter_recurse(&iter, &properties);
 
-	ret = parse_network_properties(&properties);
+	n = g_new0(struct net, 1);
+	n->modem_path = vcmanager_path;
+	vcmanager_path = NULL;
+
+	ret = parse_network_properties(n, &properties);
 	if (ret < 0) {
 		error("Unable to parse %s.GetProperty reply",
 						OFONO_NETWORKREG_INTERFACE);
 		goto done;
 	}
 
-	ret = send_method_call(OFONO_BUS_NAME, vcmanager_path,
+	ret = send_method_call(OFONO_BUS_NAME, n->modem_path,
 				OFONO_VCMANAGER_INTERFACE, "GetCalls",
 				get_calls_reply, NULL, DBUS_TYPE_INVALID);
-	if (ret < 0)
+	if (ret < 0) {
 		error("Unable to send %s.GetCalls",
 						OFONO_VCMANAGER_INTERFACE);
+		goto done;
+	}
+
+	nets = g_slist_prepend(nets, n);
+	n = NULL;
 
 done:
 	dbus_message_unref(reply);
 	remove_pending(call);
+	if (n)
+		net_free(n);
+	g_free(vcmanager_path);
 }
 
 static void network_found(const char *path)
@@ -1490,12 +1547,10 @@ static void network_found(const char *path)
 
 	DBG("%s", path);
 
-	g_free(modem_obj_path);
-	modem_obj_path = g_strdup(path);
-
 	ret = send_method_call(OFONO_BUS_NAME, path,
 				OFONO_NETWORKREG_INTERFACE, "GetProperties",
-			get_properties_reply, (void *)path, DBUS_TYPE_INVALID);
+				get_properties_reply, g_strdup(path),
+				DBUS_TYPE_INVALID);
 	if (ret < 0)
 		error("Unable to send %s.GetProperties",
 						OFONO_NETWORKREG_INTERFACE);
@@ -1503,21 +1558,29 @@ static void network_found(const char *path)
 
 static void modem_removed(const char *path)
 {
-	if (g_strcmp0(modem_obj_path, path) != 0)
-		return;
+	struct net *net = NULL;
+	GSList *l;
 
 	DBG("%s", path);
 
-	g_slist_free_full(calls, call_free);
-	calls = NULL;
+	net = net_by_name(path);
+	if (!net) {
+		DBG("Ignoring, modem with given path not found");
+		return;
+	}
 
-	g_free(net.operator_name);
-	net.operator_name = NULL;
-	net.status = NETWORK_REG_STATUS_NOSERV;
-	net.signals_bar = 0;
+	for (l = calls; l;) {
+		GSList *n = l->next;
+		struct voice_call *c = l->data;
+		if (!g_strcmp0(c->vcmanager_path, path)) {
+			calls = g_slist_remove(calls, c);
+			call_free(c);
+		}
+		l = n;
+	}
 
-	g_free(modem_obj_path);
-	modem_obj_path = NULL;
+	nets = g_slist_remove(nets, net);
+	net_free(net);
 }
 
 static void parse_modem_interfaces(const char *path, DBusMessageIter *ifaces)
@@ -1542,12 +1605,12 @@ static void parse_modem_interfaces(const char *path, DBusMessageIter *ifaces)
 
 static void modem_added(const char *path, DBusMessageIter *properties)
 {
-	if (modem_obj_path != NULL) {
-		DBG("Ignoring, modem already exist");
+	DBG("%s", path);
+
+	if (net_by_name(path)) {
+		DBG("Ignoring, modem with given path already exists");
 		return;
 	}
-
-	DBG("%s", path);
 
 	while (dbus_message_iter_get_arg_type(properties)
 						== DBUS_TYPE_DICT_ENTRY) {
@@ -1573,9 +1636,6 @@ static void modem_added(const char *path, DBusMessageIter *properties)
 
 		parse_modem_interfaces(path, &interfaces);
 
-		if (modem_obj_path != NULL)
-			return;
-
 	next:
 		dbus_message_iter_next(properties);
 	}
@@ -1598,10 +1658,6 @@ static void get_modems_reply(DBusPendingCall *call, void *user_data)
 		goto done;
 	}
 
-	/* Skip modem selection if a modem already exist */
-	if (modem_obj_path != NULL)
-		goto done;
-
 	dbus_message_iter_init(reply, &iter);
 
 	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY) {
@@ -1623,8 +1679,6 @@ static void get_modems_reply(DBusPendingCall *call, void *user_data)
 		dbus_message_iter_recurse(&item, &properties);
 
 		modem_added(path, &properties);
-		if (modem_obj_path != NULL)
-			break;
 
 		dbus_message_iter_next(&entry);
 	}
@@ -1639,8 +1693,17 @@ static gboolean handle_network_property_changed(DBusConnection *conn,
 {
 	DBusMessageIter iter, variant;
 	const char *property;
+	struct net *net = NULL;
+	const char *path;
 
 	audio_wakelock_get();
+
+	path = dbus_message_get_path(msg);
+	net = net_by_name(path);
+	if (!net) {
+		error("PropertyChange for unknown path '%s'", path);
+		return TRUE;
+	}
 
 	dbus_message_iter_init(msg, &iter);
 
@@ -1656,7 +1719,7 @@ static gboolean handle_network_property_changed(DBusConnection *conn,
 	dbus_message_iter_next(&iter);
 	dbus_message_iter_recurse(&iter, &variant);
 
-	handle_network_property(property, &variant);
+	handle_network_property(net, property, &variant);
 
 	return TRUE;
 }
@@ -1689,11 +1752,6 @@ static gboolean handle_modem_property_changed(DBusConnection *conn,
 	audio_wakelock_get();
 
 	path = dbus_message_get_path(msg);
-
-	/* Ignore if modem already exist and paths doesn't match */
-	if (modem_obj_path != NULL &&
-				g_str_equal(path, modem_obj_path) == FALSE)
-		return TRUE;
 
 	dbus_message_iter_init(msg, &iter);
 
@@ -1788,9 +1846,6 @@ static gboolean handle_manager_modem_added(DBusConnection *conn,
 	const char *path;
 
 	audio_wakelock_get();
-
-	if (modem_obj_path != NULL)
-		return TRUE;
 
 	dbus_message_iter_init(msg, &iter);
 
@@ -2080,8 +2135,8 @@ static void handle_service_disconnect(DBusConnection *conn, void *user_data)
 
 	audio_wakelock_get();
 
-	if (modem_obj_path)
-		modem_removed(modem_obj_path);
+	while (nets)
+		modem_removed(((struct net *)nets->data)->modem_path);
 }
 
 static int statefs_batt_init(const char *path)
@@ -2214,8 +2269,8 @@ void telephony_exit(void)
 	g_free(last_dialed_number_path);
 	last_dialed_number_path = NULL;
 
-	if (modem_obj_path)
-		modem_removed(modem_obj_path);
+	while (nets)
+		modem_removed(((struct net *)nets->data)->modem_path);
 
 	g_slist_free_full(watches, remove_watch);
 	watches = NULL;
